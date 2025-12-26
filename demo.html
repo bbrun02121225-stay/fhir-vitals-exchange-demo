@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="zh-Hant">
+
+<head>
+    <meta charset="utf-8">
+    <title>跨院轉診生命徵象共享 Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 24px;
+        }
+
+        h1 {
+            margin-bottom: 8px;
+        }
+
+        .card {
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+
+        .row {
+            margin-bottom: 8px;
+        }
+
+        label {
+            display: inline-block;
+            width: 200px;
+        }
+
+        input {
+            padding: 4px;
+            width: 300px;
+        }
+        select {
+            padding: 4px;
+        }
+        .actions button {
+            margin-bottom: 8px;
+        }
+
+        button {
+            padding: 6px 12px;
+            margin-right: 8px;
+        }
+
+        table {
+            border-collapse: collapse;
+            margin-top: 12px;
+            width: 100%;
+        }
+
+        th,
+        td {
+            border: 1px solid #ccc;
+            padding: 6px;
+            text-align: left;
+        }
+
+        th {
+            background: #f5f5f5;
+            width: 220px;
+        }
+
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>跨院轉診生命徵象共享 Demo</h1>
+    <p>
+        示範轉出院與轉入院如何透過 FHIR Server 共享病人近期生命徵象，
+        讓病人轉院時不必再次量測。
+    </p>
+
+    <div class="card">
+        <h2>FHIR Server 設定</h2>
+        <div class="row">
+            <label>FHIR Base URL</label>
+            <input id="baseUrl" value="http://203.64.84.177:8080/fhir">
+        </div>
+        <div class="row">
+            <label>Patient Identifier</label>
+            <input id="patientIdentifier" value="TRANSFER-DEMO-001">
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>步驟 1：建立 / 查詢病人</h2>
+        <button onclick="createPatient()">建立病人（POST Patient）</button>
+        <button onclick="findPatient()">查詢病人（GET Patient）</button>
+
+        <div class="row">
+            <label>選擇要使用的 Patient</label>
+            <select id="patientSelect" style="padding:4px; width: 320px;" onchange="onPatientSelectChange()">
+                <option value="">（請先查詢病人）</option>
+            </select>
+        </div>
+
+        <div class="row">
+            <label>Patient.id</label>
+            <input id="patientId" class="mono" placeholder="可手動修改，用於查詢/上傳" />
+        </div>
+
+        <div id="patientResult"></div>
+        <div id="patientMatches"></div>
+        <div id="patientStatus"></div>
+    </div>
+
+    <div class="card">
+        <h2>步驟 2：轉出院上傳生命徵象</h2>
+        <div class="row">
+            <label>體重（kg）</label>
+            <input id="weight" value="70.5">
+        </div>
+        <button onclick="postObservation()">上傳體重（POST Observation）</button>
+
+        <div class="row">
+            <label>Observation.id</label>
+            <input id="obsId" readonly>
+        </div>
+
+        <div id="obsSent"></div>
+        <div id="obsStatus"></div>
+    </div>
+
+    <div class="card">
+        <h2>步驟 3：轉入院查詢生命徵象（Observation）</h2>
+        <div class="actions" style="margin-bottom:8px;">
+            <button onclick="queryLatest()">查詢最近生命徵象</button>
+            <button onclick="queryAllObservations()">查詢此病人全部生命徵象</button>
+        </div>
+        <div class="row">
+            <label>查詢使用的 Patient.id</label>
+            <input id="queryPatientId" class="mono" readonly>
+        </div>
+        <div id="obsFetched"></div>
+        <div id="obsAll"></div>
+        <div id="queryStatus"></div>
+    </div>
+
+    <script>
+        function $(id) { return document.getElementById(id); }
+
+        let lastCreatedPatientId = '';
+        let activePatientId = '';
+        let lastSearchIdentifier = '';
+        let lastSearchMatches = 0;
+
+        function normalizeBaseUrl(raw) {
+            return String(raw || '').trim().replace(/\/+$/, '');
+        }
+
+        function setStatus(id, msg, ok = true) {
+            const el = $(id);
+            if (!el) return;
+            el.style.marginTop = '8px';
+            el.style.color = ok ? '#0a7' : '#c00';
+            el.textContent = msg;
+        }
+
+        function clearStatus() {
+            setStatus('patientStatus', '');
+            setStatus('obsStatus', '');
+            setStatus('queryStatus', '');
+        }
+
+        function esc(s) {
+            return String(s ?? '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#039;');
+        }
+
+        async function fhirFetch(url, options) {
+            const res = await fetch(url, options);
+            const text = await res.text();
+            let data;
+            try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+            if (!res.ok) {
+                const detail = typeof data === 'string' ? data : JSON.stringify(data);
+                throw new Error(`${res.status} ${res.statusText} :: ${detail}`);
+            }
+            return data;
+        }
+
+        function renderTable(title, rows) {
+            const body = rows.map(r => `<tr><td>${esc(r.k)}</td><td>${esc(r.v)}</td></tr>`).join('');
+            return `
+          <table>
+            <tr><th colspan="2">${esc(title)}</th></tr>
+            ${body}
+          </table>
+        `;
+        }
+
+        function renderPatientSearchSummary(identifier, matches) {
+            $('patientResult').innerHTML =
+                renderTable('查詢摘要', [
+                    { k: 'identifier.value', v: identifier || '(empty)' },
+                    { k: 'matches', v: String(matches ?? 0) },
+                    { k: 'current Patient.id', v: getActivePatientId() || '(empty)' },
+                    { k: 'last created Patient.id', v: lastCreatedPatientId || '(none)' }
+                ]);
+        }
+
+        function setActivePatientId(id) {
+            activePatientId = String(id || '').trim();
+            $('patientId').value = activePatientId;
+            // Step 3 顯示目前查詢會使用的 Patient.id
+            if ($('queryPatientId')) {
+                $('queryPatientId').value = activePatientId;
+            }
+        }
+
+        function getActivePatientId() {
+            // 以輸入框為準（允許手動修改），並同步到 Step 3 顯示欄位
+            const id = String($('patientId').value || '').trim();
+            if ($('queryPatientId')) {
+                $('queryPatientId').value = id;
+            }
+            return id;
+        }
+
+        function renderPatientPickList(patients, identifier) {
+            if (!patients.length) return '';
+
+            const rows = patients.map((p) => {
+                const id = p.id || '';
+                const idTag = (id === lastCreatedPatientId) ? '（剛建立）' : '';
+                const lastUpdated = (p.meta && p.meta.lastUpdated) ? p.meta.lastUpdated : '';
+
+                return `
+                  <tr>
+                    <td class="mono">${esc(id)}</td>
+                    <td>${esc(lastUpdated)}</td>
+                    <td>
+                      <button type="button" onclick="selectPatient('${esc(id)}')">使用此病人</button>
+                      <span style="color:#555; margin-left:6px;">${esc(idTag)}</span>
+                    </td>
+                  </tr>
+                `;
+            }).join('');
+
+            const headerNote = lastCreatedPatientId
+                ? `目前保留的剛建立 Patient.id：<span class="mono">${esc(lastCreatedPatientId)}</span>`
+                : `尚未建立新病人；請先建立或選擇一筆。`;
+
+            return `
+              <div style="margin-top:12px;">
+                <p style="margin:0 0 8px; color:#555;">identifier.value = <span class="mono">${esc(identifier)}</span></p>
+                <p style="margin:0 0 8px; color:#555;">${headerNote}</p>
+                <table>
+                  <tr>
+                    <th>Patient.id</th>
+                    <th>meta.lastUpdated</th>
+                    <th>操作</th>
+                  </tr>
+                  ${rows}
+                </table>
+              </div>
+            `;
+        }
+
+        async function createPatient() {
+            clearStatus();
+
+            const base = normalizeBaseUrl($('baseUrl').value);
+            const identifier = $('patientIdentifier').value.trim();
+
+            if (!base) { setStatus('patientStatus', 'FHIR Base URL 不可為空。', false); return; }
+            if (!identifier) { setStatus('patientStatus', 'Patient Identifier 不可為空。', false); return; }
+
+            // 最小可用 Patient：identifier
+            const payload = {
+                resourceType: 'Patient',
+                identifier: [{ system: 'https://example.org/identifier', value: identifier }]
+            };
+
+            try {
+                setStatus('patientStatus', '建立病人中…');
+                const data = await fhirFetch(`${base}/Patient`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/fhir+json' },
+                    body: JSON.stringify(payload)
+                });
+
+                lastCreatedPatientId = data.id || '';
+                setActivePatientId(data.id || '');
+                const sel = $('patientSelect');
+                if (sel) {
+                    // 若下拉已有該 id，選起來；沒有就先不強塞
+                    sel.value = data.id || '';
+                }
+
+                if (lastSearchIdentifier) {
+                    renderPatientSearchSummary(lastSearchIdentifier, lastSearchMatches);
+                }
+
+                $('patientResult').innerHTML =
+                    renderTable('送出的欄位', [
+                        { k: 'identifier.value', v: identifier }
+                    ]) +
+                    renderTable('伺服器回傳欄位', [
+                        { k: 'id', v: data.id || '' },
+                        { k: 'identifier.value', v: (data.identifier && data.identifier[0] && data.identifier[0].value) || '' }
+                    ]);
+
+                setStatus('patientStatus', 'Patient 建立完成。', true);
+            } catch (e) {
+                setStatus('patientStatus', `建立失敗：${e.message}`, false);
+            }
+        }
+
+        async function findPatient() {
+            clearStatus();
+
+            const base = normalizeBaseUrl($('baseUrl').value);
+            const identifier = $('patientIdentifier').value.trim();
+
+            if (!base) { setStatus('patientStatus', 'FHIR Base URL 不可為空。', false); return; }
+            if (!identifier) { setStatus('patientStatus', 'Patient Identifier 不可為空。', false); return; }
+
+            // 常見查詢：Patient?identifier=<system>|<value>
+            const q = `Patient?identifier=${encodeURIComponent('https://example.org/identifier|' + identifier)}`;
+
+            try {
+                setStatus('patientStatus', '查詢病人中…');
+                const bundle = await fhirFetch(`${base}/${q}`, { method: 'GET' });
+
+                const entry = (bundle && bundle.entry) ? bundle.entry : [];
+                if (!entry.length) {
+                    $('patientId').value = '';
+                    $('patientResult').innerHTML = '';
+                    setStatus('patientStatus', '查無此病人（identifier）。', false);
+                    return;
+                }
+
+                const patients = entry.map(e => e.resource).filter(Boolean);
+
+                lastSearchIdentifier = identifier;
+                lastSearchMatches = patients.length;
+                renderPatientSearchSummary(lastSearchIdentifier, lastSearchMatches);
+
+                populatePatientSelect(patients);
+                $('patientMatches').innerHTML = renderPatientPickList(patients, identifier);
+
+                setStatus('patientStatus', '查詢完成：請從清單選擇要使用的 Patient。', true);
+            } catch (e) {
+                setStatus('patientStatus', `查詢失敗：${e.message}`, false);
+            }
+        }
+
+        async function postObservation() {
+            clearStatus();
+
+            const base = normalizeBaseUrl($('baseUrl').value);
+            const patientId = getActivePatientId();
+            const weightStr = $('weight').value;
+
+            if (!base) { setStatus('obsStatus', 'FHIR Base URL 不可為空。', false); return; }
+            if (!patientId) { setStatus('obsStatus', '請先取得 Patient.id（先建立或查詢病人）。', false); return; }
+
+            const weight = Number(weightStr);
+            if (!Number.isFinite(weight) || weight <= 0) {
+                setStatus('obsStatus', '體重必須是大於 0 的數字。', false);
+                return;
+            }
+
+            const payload = {
+                resourceType: 'Observation',
+                status: 'final',
+                category: [{
+                    coding: [{
+                        system: 'http://terminology.hl7.org/CodeSystem/observation-category',
+                        code: 'vital-signs'
+                    }]
+                }],
+                code: { text: 'Body weight' },
+                subject: { reference: `Patient/${patientId}` },
+                valueQuantity: { value: weight, unit: 'kg' }
+            };
+
+            try {
+                setStatus('obsStatus', '上傳生命徵象中…');
+                const data = await fhirFetch(`${base}/Observation`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/fhir+json' },
+                    body: JSON.stringify(payload)
+                });
+
+                $('obsId').value = data.id || '';
+
+                $('obsSent').innerHTML =
+                    renderTable('送出的欄位', [
+                        { k: '項目', v: '體重' },
+                        { k: '數值', v: `${weight} kg` },
+                        { k: 'subject.reference', v: `Patient/${patientId}` }
+                    ]) +
+                    renderTable('伺服器回傳欄位', [
+                        { k: 'id', v: data.id || '' },
+                        { k: 'code.text', v: (data.code && data.code.text) || '' },
+                        { k: 'value', v: (data.valueQuantity ? `${data.valueQuantity.value} ${data.valueQuantity.unit}` : '') },
+                        { k: 'subject.reference', v: (data.subject && data.subject.reference) || '' }
+                    ]);
+
+                setStatus('obsStatus', 'Observation 上傳完成（轉出院已交接）。', true);
+            } catch (e) {
+                setStatus('obsStatus', `上傳失敗：${e.message}`, false);
+            }
+        }
+
+        async function queryLatest() {
+            clearStatus();
+
+            const base = normalizeBaseUrl($('baseUrl').value);
+            const patientId = getActivePatientId();
+
+            if (!base) { setStatus('queryStatus', 'FHIR Base URL 不可為空。', false); return; }
+            if (!patientId) { setStatus('queryStatus', '請先取得 Patient.id（先建立或查詢病人）。', false); return; }
+
+            // 取最近一筆 vital-signs
+            const q = `Observation?patient=${encodeURIComponent(patientId)}&category=vital-signs&_sort=-date&_count=1`;
+
+            try {
+                setStatus('queryStatus', '查詢最近生命徵象中…');
+                const bundle = await fhirFetch(`${base}/${q}`, { method: 'GET' });
+
+                const entry = (bundle && bundle.entry) ? bundle.entry : [];
+                if (!entry.length) {
+                    $('obsFetched').innerHTML = '';
+                    setStatus('queryStatus', '查無生命徵象資料。', false);
+                    return;
+                }
+
+                const obs = entry[0].resource;
+
+                const val = obs.valueQuantity ? `${obs.valueQuantity.value} ${obs.valueQuantity.unit}` : '';
+
+                $('obsFetched').innerHTML = renderTable('轉入院查回（最近一次生命徵象）', [
+                    { k: '查詢使用的 Patient.id', v: patientId },
+                    { k: 'Observation.id', v: obs.id || '' },
+                    { k: '項目', v: (obs.code && obs.code.text) || '' },
+                    { k: '數值', v: val },
+                    { k: 'subject.reference', v: (obs.subject && obs.subject.reference) || '' }
+                ]);
+
+                setStatus('queryStatus', '已取得近期生命徵象，可免重測。', true);
+            } catch (e) {
+                setStatus('queryStatus', `查詢失敗：${e.message}`, false);
+            }
+        }
+
+        async function queryAllObservations() {
+            clearStatus();
+
+            const base = normalizeBaseUrl($('baseUrl').value);
+            const patientId = getActivePatientId();
+
+            if (!base) { setStatus('queryStatus', 'FHIR Base URL 不可為空。', false); return; }
+            if (!patientId) { setStatus('queryStatus', '請先選擇/輸入 Patient.id。', false); return; }
+
+            // 查該病人所有 vital-signs（取前 50 筆，依日期降冪）
+            const q = `Observation?patient=${encodeURIComponent(patientId)}&category=vital-signs&_sort=-date&_count=50`;
+
+            try {
+                setStatus('queryStatus', '查詢此病人全部生命徵象中…');
+                const bundle = await fhirFetch(`${base}/${q}`, { method: 'GET' });
+
+                const entry = (bundle && bundle.entry) ? bundle.entry : [];
+                if (!entry.length) {
+                    $('obsAll').innerHTML = '';
+                    setStatus('queryStatus', '查無生命徵象資料。', false);
+                    return;
+                }
+
+                const obsList = entry.map(e => e.resource).filter(Boolean);
+
+                const rows = obsList.map((obs) => {
+                    const id = obs.id || '';
+                    const codeText = (obs.code && obs.code.text) ? obs.code.text : '';
+                    const when = obs.effectiveDateTime || obs.issued || '';
+
+                    let value = '';
+                    if (obs.valueQuantity) {
+                        value = `${obs.valueQuantity.value ?? ''} ${obs.valueQuantity.unit ?? ''}`.trim();
+                    } else if (obs.valueString) {
+                        value = String(obs.valueString);
+                    } else if (Array.isArray(obs.component) && obs.component.length) {
+                        // 血壓等 component 類型：簡化顯示前兩個
+                        const parts = obs.component.slice(0, 2).map(c => {
+                            const vt = c.valueQuantity;
+                            const ct = c.code && c.code.coding && c.code.coding[0] ? c.code.coding[0].display : '';
+                            if (vt) return `${ct}:${vt.value ?? ''}${vt.unit ?? ''}`;
+                            return ct;
+                        });
+                        value = parts.join(' | ');
+                    }
+
+                    return `<tr>
+                        <td class="mono">${esc(id)}</td>
+                        <td>${esc(codeText)}</td>
+                        <td>${esc(value)}</td>
+                        <td class="mono">${esc(when)}</td>
+                        <td class="mono">${esc((obs.subject && obs.subject.reference) || '')}</td>
+                    </tr>`;
+                }).join('');
+
+                $('obsAll').innerHTML = `
+                  <table>
+                    <tr><th colspan="5">此病人全部生命徵象（最多 50 筆，依日期新→舊）</th></tr>
+                    <tr>
+                      <th>Observation.id</th>
+                      <th>項目</th>
+                      <th>數值</th>
+                      <th>時間</th>
+                      <th>subject.reference</th>
+                    </tr>
+                    ${rows}
+                  </table>
+                `;
+
+                setStatus('queryStatus', `已取得 ${obsList.length} 筆生命徵象。`, true);
+            } catch (e) {
+                setStatus('queryStatus', `查詢失敗：${e.message}`, false);
+            }
+        }
+
+        function selectPatient(id) {
+            // 只清狀態訊息，不清掉查詢清單
+            setStatus('patientStatus', '');
+            setStatus('obsStatus', '');
+            setStatus('queryStatus', '');
+
+            setActivePatientId(id);
+            if ($('obsAll')) $('obsAll').innerHTML = '';
+            if ($('obsFetched')) $('obsFetched').innerHTML = '';
+
+            // 重新渲染查詢摘要，避免 current Patient.id 顯示舊值
+            if (lastSearchIdentifier) {
+                renderPatientSearchSummary(lastSearchIdentifier, lastSearchMatches);
+            }
+
+            setStatus('patientStatus', `已選擇 Patient.id = ${id}`, true);
+        }
+
+        function populatePatientSelect(patients) {
+            const sel = $('patientSelect');
+            if (!sel) return;
+
+            // 清空
+            sel.innerHTML = '';
+
+            if (!patients.length) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = '（查無病人）';
+                sel.appendChild(opt);
+                return;
+            }
+
+            const hint = document.createElement('option');
+            hint.value = '';
+            hint.textContent = '（請選擇要使用的 Patient）';
+            sel.appendChild(hint);
+
+            patients.forEach((p) => {
+                const id = (p && p.id) ? String(p.id) : '';
+                if (!id) return;
+
+                const lastUpdated = (p.meta && p.meta.lastUpdated) ? p.meta.lastUpdated : '';
+                const tag = (id === lastCreatedPatientId) ? ' (剛建立)' : '';
+
+                const opt = document.createElement('option');
+                opt.value = id;
+                opt.textContent = `${id}${tag}${lastUpdated ? ' | ' + lastUpdated : ''}`;
+                sel.appendChild(opt);
+            });
+
+            // 若目前已經有 active patient，就把下拉選到一致
+            const current = getActivePatientId();
+            if (current) sel.value = current;
+        }
+
+        function onPatientSelectChange() {
+            const sel = $('patientSelect');
+            if (!sel) return;
+            const id = String(sel.value || '').trim();
+            if (!id) return;
+            selectPatient(id);
+        }
+
+        // expose for inline onclick
+        window.createPatient = createPatient;
+        window.findPatient = findPatient;
+        window.postObservation = postObservation;
+        window.queryLatest = queryLatest;
+        window.selectPatient = selectPatient;
+        window.queryAllObservations = queryAllObservations;
+        window.onPatientSelectChange = onPatientSelectChange;
+    </script>
+
+</body>
+
+</html>
